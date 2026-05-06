@@ -1,0 +1,10 @@
+service:
+  name: scraper-orchestrator
+  runtime: python:3.10
+  build_command: |
+    pip install -r requirements.txt
+    playwright install chromium
+  start_command: uvicorn main:app --host 0.0.0.0 --port $PORT
+  env:
+    - name: OPENAI_API_KEY
+      type: secret
