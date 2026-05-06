@@ -460,5 +460,14 @@ def generate_business_profile(req: OnboardingRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/")
+def read_root():
+    return {"message": "Scraper is active"}
+
+@app.get("/kaithhealthcheck")
+@app.get("/kaithheathcheck")
+def health_check():
+    return {"status": "ok"}
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
