@@ -439,22 +439,33 @@ class OnboardingRequest(BaseModel):
 @app.post("/generate-profile")
 def generate_business_profile(req: OnboardingRequest):
     try:
+        # 1. Harvest the raw data (including the products)
         raw_info = harvester(req.url)
         
+        # 2. Generate the AI Profile
         final_profile = chef(raw_info)
         if not final_profile:
             raise HTTPException(status_code=500, detail="Chef failed to generate profile.")
             
+        # 3. Generate the Markdown Instructions
         bot_instructions = architect(final_profile, raw_info['text'])
         if not bot_instructions:
             raise HTTPException(status_code=500, detail="Architect failed to generate instructions.")
             
         business_name = final_profile.get("business_name", "New Business")
         
+        # --- THE FIX: Extract Products for the Database ---
+        # Prioritize structured products, fallback to custom candidates
+        extracted_products = raw_info.get("products", [])
+        if not extracted_products:
+            extracted_products = raw_info.get("custom_candidates", [])
+        
+        # 4. Return everything nicely separated
         return {
             "name": business_name,
             "profile_json": final_profile,
-            "instructions_md": bot_instructions
+            "instructions_md": bot_instructions,
+            "products": extracted_products  # <--- Now the Edge Function can see them!
         }
 
     except Exception as e:
