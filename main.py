@@ -4,7 +4,7 @@ import re
 import requests
 import warnings
 from bs4 import BeautifulSoup
-import anthropic
+from openai import OpenAI
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from urllib.parse import urljoin, urlparse
@@ -19,15 +19,15 @@ load_dotenv()
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-anthropic_key  = os.getenv("ANTHROPIC_API_KEY")
-supabase_url   = os.getenv("SUPABASE_URL")
-supabase_key   = os.getenv("SUPABASE_SERVICE_KEY")
+openai_key   = os.getenv("OPENAI_API_KEY")
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
 
-client_ai : anthropic.Anthropic = anthropic.Anthropic(api_key=anthropic_key)
-supabase  : Client               = create_client(supabase_url, supabase_key)
+client_ai : OpenAI  = OpenAI(api_key=openai_key)
+supabase  : Client  = create_client(supabase_url, supabase_key)
 
-CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
-MAX_PAGE_CHARS = 50000   # per-page character limit before saving
+OPENAI_MODEL   = "gpt-4.1-mini"
+MAX_PAGE_CHARS = 60000   # gpt-4.1-mini has large context — we can afford more
 
 playwright_available = False
 try:
@@ -70,7 +70,7 @@ def save_raw_page(business_id: str, page_url: str, page_type: str, raw_text: str
             "raw_text":    raw_text[:MAX_PAGE_CHARS],
             "version":     version
         }).execute()
-        print(f"  [DB] Saved {page_type} ({len(raw_text)} chars, v{version})")
+        print(f"  [DB] Saved '{page_type}' page ({len(raw_text)} chars, v{version})")
     except Exception as e:
         print(f"  [DB] Failed to save raw page ({page_type}): {e}")
 
@@ -81,13 +81,16 @@ def save_business_knowledge(business_id: str, knowledge_md: str, profile_json: d
             "business_knowledge": knowledge_md,
             "ai_config": {"scraper_profile": profile_json}
         }).eq("business_id", business_id).execute()
-        print(f"  [DB] Business knowledge saved")
+        print(f"  [DB] Business knowledge saved for {business_id}")
     except Exception as e:
         print(f"  [DB] Failed to save business knowledge: {e}")
 
 
 def fetch_bot_config(bot_id: str) -> dict:
-    """Pull prompt + model settings from ai_bots_config. Falls back silently."""
+    """
+    Pull prompt + model settings from ai_bots_config.
+    Returns empty dict on failure — callers fall back to hardcoded defaults.
+    """
     try:
         res = (
             supabase.table("ai_bots_config")
@@ -101,22 +104,22 @@ def fetch_bot_config(bot_id: str) -> dict:
             return res.data
     except Exception:
         pass
-    print(f"  [Config] {bot_id} not in ai_bots_config — using fallback prompt")
+    print(f"  [Config] '{bot_id}' not found in ai_bots_config — using fallback")
     return {}
 
 # ==========================================
 # 3. HTML UTILITY FUNCTIONS
 # ==========================================
 def clean_soup_for_text(soup: BeautifulSoup) -> BeautifulSoup:
-    """Strip nav, footer, cookie banners and other boilerplate before extracting text."""
-    noise_selectors = [
+    """Remove navigation, footers, cookie banners and other boilerplate."""
+    for sel in [
         "script", "style", "noscript", "svg", "nav", "header",
         "footer", "aside", "iframe", "form",
         "[class*='cookie']", "[class*='popup']", "[class*='modal']",
-        "[class*='banner']", "[id*='cookie']", "[id*='popup']",
-        "[class*='newsletter']", "[class*='subscribe']"
-    ]
-    for sel in noise_selectors:
+        "[class*='banner']", "[id*='cookie']",   "[id*='popup']",
+        "[class*='newsletter']", "[class*='subscribe']",
+        "[class*='sidebar']",    "[class*='widget']"
+    ]:
         for tag in soup.select(sel):
             tag.extract()
     return soup
@@ -128,7 +131,7 @@ def get_clean_soup(url: str, headers: dict) -> BeautifulSoup | None:
         if r.status_code == 200:
             return BeautifulSoup(r.text, 'html.parser')
     except Exception as e:
-        print(f"    ✘ requests failed for {url}: {e}")
+        print(f"    ✘ requests failed ({url}): {e}")
     return None
 
 
@@ -140,12 +143,12 @@ def render_page_html(url: str, headers: dict, timeout: int = 20000) -> Beautiful
             browser = p.chromium.launch(headless=True)
             page    = browser.new_page(user_agent=headers.get("User-Agent", ""))
             page.goto(url, timeout=timeout)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(2500)
             html = page.content()
             browser.close()
             return BeautifulSoup(html, 'html.parser')
     except Exception as e:
-        print(f"    ✘ Playwright failed for {url}: {e}")
+        print(f"    ✘ Playwright failed ({url}): {e}")
         return None
 
 
@@ -165,6 +168,7 @@ def format_price(raw_price) -> str:
         price_str = re.sub(r'[^\d.]', '', str(raw_price))
         if not price_str:
             return str(raw_price)
+        # Handle prices stored as integers without decimal (e.g. 699900 → 6,999.00)
         if len(price_str) >= 5 and '.' not in price_str:
             return "{:,.2f}".format(float(price_str) / 100)
         return "{:,.2f}".format(float(price_str))
@@ -173,97 +177,126 @@ def format_price(raw_price) -> str:
 
 
 def extract_meta_info(soup: BeautifulSoup) -> dict:
-    """OG tags and meta description — present on nearly every site, even simple ones."""
+    """OG tags and meta description — present on nearly every site."""
     info = {}
     for name, attr, key in [
-        ("description",     "name",     "meta_description"),
-        ("og:title",        "property", "og_title"),
-        ("og:description",  "property", "og_description"),
-        ("og:site_name",    "property", "site_name"),
-        ("twitter:description", "name", "twitter_description"),
+        ("description",         "name",     "meta_description"),
+        ("og:title",            "property", "og_title"),
+        ("og:description",      "property", "og_description"),
+        ("og:site_name",        "property", "site_name"),
+        ("twitter:description", "name",     "twitter_description"),
     ]:
         tag = soup.find("meta", attrs={attr: name})
         if tag:
-            info[key] = tag.get("content", "").strip()
+            value = (tag.get("content") or "").strip()
+            if value:
+                info[key] = value
 
-    title = soup.find("title")
-    if title:
-        info["page_title"] = title.get_text(strip=True)
+    title_tag = soup.find("title")
+    if title_tag:
+        info["page_title"] = title_tag.get_text(strip=True)
 
     return info
 
 
 def extract_contact_info(soup: BeautifulSoup) -> dict:
-    """Phone numbers, emails, physical addresses — using Kenyan number patterns."""
+    """
+    Phone numbers, emails, and physical addresses.
+    Uses Kenyan number patterns: 07xx, 01xx, +254.
+    """
     text = soup.get_text()
 
-    phone_re   = re.compile(r'(\+254[\s\-]?\d{3}[\s\-]?\d{3}[\s\-]?\d{3}|0[17]\d{8}|0\d{2}[\s\-]?\d{3}[\s\-]?\d{4})')
-    email_re   = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+    phone_re = re.compile(
+        r'(\+254[\s\-]?\d{3}[\s\-]?\d{3}[\s\-]?\d{3}'
+        r'|0[17]\d{8}'
+        r'|0\d{2}[\s\-]?\d{3}[\s\-]?\d{4})'
+    )
+    email_re = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
     address_re = re.compile(
-        r'(P\.?O\.?\s*Box[\s\w,\.]+|(?:Nairobi|Mombasa|Kisumu|Nakuru|Eldoret|Thika|Westlands|Kilimani|Karen|CBD)[\w\s,\.\-]{5,60})',
+        r'(P\.?O\.?\s*Box[\s\w,\.]+|'
+        r'(?:Nairobi|Mombasa|Kisumu|Nakuru|Eldoret|Thika|Westlands|'
+        r'Kilimani|Karen|CBD|Upperhill|Lavington|Hurlingham)[\w\s,\.\-]{5,80})',
         re.IGNORECASE
     )
 
     phones    = list(dict.fromkeys(phone_re.findall(text)))[:5]
-    emails    = [e for e in dict.fromkeys(email_re.findall(text))
-                 if not any(x in e.lower() for x in ['example', 'youremail', 'domain', 'email.com'])][:5]
-    addresses = list(dict.fromkeys(address_re.findall(text)))[:3]
+    emails    = [
+        e for e in dict.fromkeys(email_re.findall(text))
+        if not any(x in e.lower() for x in ['example', 'youremail', 'domain', 'email.com'])
+    ][:5]
+    addresses = list(dict.fromkeys(m if isinstance(m, str) else m[0]
+                                   for m in address_re.findall(text)))[:3]
 
     return {"phones": phones, "emails": emails, "addresses": addresses}
 
 
 def extract_table_pricing(soup: BeautifulSoup) -> list:
-    """HTML tables with a pricing column — very common on Kenyan agency/service sites."""
+    """
+    Finds HTML tables that contain a pricing column.
+    Very common on Kenyan agency, service, and portfolio sites.
+    """
     results = []
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
         if len(rows) < 2:
             continue
 
-        headers = [cell.get_text(strip=True).lower() for cell in rows[0].find_all(["th", "td"])]
+        headers = [cell.get_text(strip=True).lower()
+                   for cell in rows[0].find_all(["th", "td"])]
 
-        price_col = next((i for i, h in enumerate(headers)
-                          if any(k in h for k in ["price", "cost", "rate", "amount", "fee", "ksh", "kes"])), None)
-        name_col  = next((i for i, h in enumerate(headers)
-                          if any(k in h for k in ["service", "package", "product", "plan", "name", "item", "description"])), 0)
+        price_col = next(
+            (i for i, h in enumerate(headers)
+             if any(k in h for k in ["price", "cost", "rate", "amount", "fee", "ksh", "kes"])),
+            None
+        )
+        name_col = next(
+            (i for i, h in enumerate(headers)
+             if any(k in h for k in ["service", "package", "product", "plan",
+                                      "name", "item", "description", "details"])),
+            0
+        )
 
         for row in rows[1:]:
             cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
             if not cells:
                 continue
             name  = cells[name_col] if name_col < len(cells) else cells[0]
-            price = cells[price_col] if price_col is not None and price_col < len(cells) else "Contact for price"
-            if name and len(name) > 2 and len(name) < 200:
+            price = (cells[price_col]
+                     if price_col is not None and price_col < len(cells)
+                     else "Contact for price")
+            if name and 2 < len(name) < 200:
                 results.append({"title": name, "price": price, "source": "table"})
 
     return results
 
 
 def extract_pricing_cards(soup: BeautifulSoup) -> list:
-    """CSS class-based card/tile extraction — pricing sections, package blocks."""
+    """
+    CSS class-based card/tile detection for pricing sections and package blocks.
+    Works on most modern Kenyan business sites using card layouts.
+    """
     results  = []
     seen     = set()
     price_re = re.compile(
-        r'(KSh|KES|Ksh|ksh|/=|per month|monthly|annually|\d{1,3},\d{3})', re.IGNORECASE
+        r'(KSh|KES|Ksh|ksh|/=|per\s+month|monthly|annually|\d{1,3},\d{3})',
+        re.IGNORECASE
     )
 
-    card_selectors = [
+    for selector in [
         "[class*='pricing']", "[class*='package']", "[class*='plan']",
         "[class*='service-card']", "[class*='price-card']", "[class*='tier']",
-        "[class*='offer']", "[class*='tariff']"
-    ]
-
-    for selector in card_selectors:
+        "[class*='offer']", "[class*='tariff']", "[class*='product-card']"
+    ]:
         for card in soup.select(selector):
             text = card.get_text(separator=" ", strip=True)
-            if not price_re.search(text) or len(text) < 20 or len(text) > 1200:
+            if not price_re.search(text) or not (20 < len(text) < 1200):
                 continue
 
             heading = card.find(["h2", "h3", "h4", "strong"])
             title   = heading.get_text(strip=True) if heading else text[:60]
 
             price_match = re.search(r'(?:KSh|KES|Ksh)?\s*[\d,]+(?:\.\d{2})?', text)
-            price = price_match.group(0).strip() if price_match else "Contact for price"
+            price       = price_match.group(0).strip() if price_match else "Contact for price"
 
             key = (title[:50], price)
             if key not in seen:
@@ -274,20 +307,23 @@ def extract_pricing_cards(soup: BeautifulSoup) -> list:
 
 
 def extract_service_headings(soup: BeautifulSoup) -> list:
-    """Pull h2/h3 headings + the paragraph that follows as service descriptions."""
+    """
+    Pull h2/h3 headings with the paragraph that follows.
+    Works on flat service/portfolio pages with no structured data.
+    """
     services     = []
     skip_phrases = {
         "menu", "navigation", "footer", "header", "login", "sign up",
         "register", "home", "contact us", "about us", "follow us",
         "get in touch", "latest posts", "recent posts", "tags", "categories",
-        "search", "subscribe", "newsletter"
+        "search", "subscribe", "newsletter", "our clients", "partners"
     }
 
     for tag in soup.find_all(["h2", "h3"]):
         text = tag.get_text(strip=True)
-        if not text or len(text) < 3 or len(text) > 100:
+        if not text or not (3 < len(text) < 120):
             continue
-        if text.lower() in skip_phrases or any(p in text.lower() for p in skip_phrases):
+        if any(p in text.lower() for p in skip_phrases):
             continue
 
         next_p = tag.find_next_sibling("p")
@@ -299,7 +335,7 @@ def extract_service_headings(soup: BeautifulSoup) -> list:
 
 
 def parse_json_ld_products(soup: BeautifulSoup, base_url: str) -> list:
-    """Schema.org Product and ItemList structured data."""
+    """Schema.org structured data — Product and ItemList types."""
     candidates = []
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -307,8 +343,7 @@ def parse_json_ld_products(soup: BeautifulSoup, base_url: str) -> list:
         except Exception:
             continue
 
-        objects = payload if isinstance(payload, list) else [payload]
-        for obj in objects:
+        for obj in (payload if isinstance(payload, list) else [payload]):
             if not isinstance(obj, dict):
                 continue
             if obj.get("@type") == "Product":
@@ -321,8 +356,8 @@ def parse_json_ld_products(soup: BeautifulSoup, base_url: str) -> list:
                     price = obj["offers"].get("price")
                 if title:
                     candidates.append({
-                        "title": title.strip(),
-                        "price": format_price(price),
+                        "title":     title.strip(),
+                        "price":     format_price(price),
                         "image_url": urljoin(base_url, image) if image else None
                     })
             if obj.get("@type") in ["ItemList", "Collection"]:
@@ -333,33 +368,41 @@ def parse_json_ld_products(soup: BeautifulSoup, base_url: str) -> list:
                         image = product.get("image")
                         if isinstance(image, list):
                             image = image[0]
-                        price = product.get("offers", {}).get("price") if isinstance(product.get("offers"), dict) else None
+                        price = (product.get("offers", {}).get("price")
+                                 if isinstance(product.get("offers"), dict) else None)
                         if title:
                             candidates.append({
-                                "title": title.strip(),
-                                "price": format_price(price),
+                                "title":     title.strip(),
+                                "price":     format_price(price),
                                 "image_url": urljoin(base_url, image) if image else None
                             })
     return candidates
 
 
 def extract_custom_candidates(soup: BeautifulSoup, base_url: str) -> list:
-    """Fallback: image + price pattern detection for ecommerce product grids."""
-    candidates  = []
-    price_re    = re.compile(r'(KSh|KES|₨|/=|UGX|TZS|NGN|USD|EUR|£|\d{2,3}(?:[.,]\d{2,3})?)')
-    skip_src    = ['logo', 'banner', 'icon', 'sprite', 'avatar', 'facebook', 'twitter', 'instagram']
+    """
+    Fallback: image + price pattern detection for ecommerce product grids.
+    Handles sites without structured data.
+    """
+    candidates = []
+    price_re   = re.compile(
+        r'(KSh|KES|₨|/=|UGX|TZS|NGN|USD|EUR|£|\d{2,3}(?:[.,]\d{2,3})?)'
+    )
+    skip_src   = ['logo', 'banner', 'icon', 'sprite', 'avatar',
+                  'facebook', 'twitter', 'instagram', 'whatsapp']
 
     for container in soup.find_all(["div", "li", "article", "section"]):
         img = container.find("img")
         if not img:
             continue
         text = container.get_text(separator=" ", strip=True)
-        if len(text) < 20 or len(text) > 800:
+        if not (20 < len(text) < 800):
             continue
         match = price_re.search(text)
         if not match:
             continue
-        src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or img.get("data-original")
+        src = (img.get("src") or img.get("data-src")
+               or img.get("data-lazy-src") or img.get("data-original"))
         if not src or any(x in src.lower() for x in skip_src):
             continue
         heading = container.find(["h1", "h2", "h3", "h4", "a"])
@@ -390,7 +433,7 @@ TARGET_CATEGORIES = {
     "faq":          ["faq", "faqs", "questions", "support", "help"],
     "contact":      ["contact", "reach-us", "location", "find-us", "get-in-touch"],
     "portfolio":    ["portfolio", "gallery", "work", "projects", "case-studies"],
-    "testimonials": ["testimonials", "reviews", "clients"]
+    "testimonials": ["testimonials", "reviews", "clients", "what-clients-say"]
 }
 
 HEADERS = {
@@ -408,11 +451,14 @@ def harvester(url: str, business_id: str) -> dict:
     products          = []
     custom_candidates = []
     service_headings  = []
-    all_pages         = {}   # page_type -> (page_url, text)
+    all_pages         = {}   # page_type → (page_url, text)
 
     # ── Shopify API ──────────────────────────────────────────────
     try:
-        r = requests.get(url.rstrip("/") + "/products.json", headers=HEADERS, timeout=5, verify=False)
+        r = requests.get(
+            url.rstrip("/") + "/products.json",
+            headers=HEADERS, timeout=5, verify=False
+        )
         if r.status_code == 200:
             for p in r.json().get("products", [])[:10]:
                 products.append({
@@ -420,14 +466,18 @@ def harvester(url: str, business_id: str) -> dict:
                     "price":     format_price((p.get("variants") or [{}])[0].get("price")),
                     "image_url": ((p.get("images") or [{}])[0].get("src"))
                 })
-            print(f"  ✓ Shopify: {len(products)} products")
+            if products:
+                print(f"  ✓ Shopify API: {len(products)} products")
     except Exception:
         pass
 
     # ── WooCommerce API ──────────────────────────────────────────
     if not products:
         try:
-            r = requests.get(url.rstrip("/") + "/wp-json/wc/store/products", headers=HEADERS, timeout=5, verify=False)
+            r = requests.get(
+                url.rstrip("/") + "/wp-json/wc/store/products",
+                headers=HEADERS, timeout=5, verify=False
+            )
             if r.status_code == 200:
                 for p in r.json()[:10]:
                     products.append({
@@ -435,15 +485,19 @@ def harvester(url: str, business_id: str) -> dict:
                         "price":     format_price((p.get("prices") or {}).get("price")),
                         "image_url": ((p.get("images") or [{}])[0].get("src"))
                     })
-                print(f"  ✓ WooCommerce: {len(products)} products")
+                if products:
+                    print(f"  ✓ WooCommerce API: {len(products)} products")
         except Exception:
             pass
 
-    # ── Scrape Homepage ──────────────────────────────────────────
+    # ── Homepage ─────────────────────────────────────────────────
     soup = fetch_page(url, HEADERS)
     if not soup:
-        return {"products": [], "custom_candidates": [], "text": "",
-                "url": url, "contact_info": {}, "service_headings": [], "all_pages": {}}
+        print("  ✗ Could not fetch homepage")
+        return {
+            "products": [], "custom_candidates": [], "text": "",
+            "url": url, "contact_info": {}, "service_headings": [], "all_pages": {}
+        }
 
     meta_info    = extract_meta_info(soup)
     contact_info = extract_contact_info(soup)
@@ -451,12 +505,12 @@ def harvester(url: str, business_id: str) -> dict:
     cleaned_home = clean_soup_for_text(BeautifulSoup(str(soup), "html.parser"))
     homepage_text = (
         f"[META]\n{json.dumps(meta_info, ensure_ascii=False)}\n\n"
-        f"[CONTACT]\n{json.dumps(contact_info, ensure_ascii=False)}\n\n"
-        f"[HOMEPAGE]\n{cleaned_home.get_text(separator=' ', strip=True)}"
+        f"[CONTACT FOUND ON PAGE]\n{json.dumps(contact_info, ensure_ascii=False)}\n\n"
+        f"[HOMEPAGE TEXT]\n{cleaned_home.get_text(separator=' ', strip=True)}"
     )
     all_pages["homepage"] = (url, homepage_text)
 
-    # ── Extract products/services from homepage if no API data ──
+    # ── Product/service extraction from homepage ─────────────────
     if not products:
         custom_candidates.extend(parse_json_ld_products(soup, url))
         custom_candidates.extend(extract_table_pricing(soup))
@@ -464,8 +518,9 @@ def harvester(url: str, business_id: str) -> dict:
         custom_candidates.extend(extract_custom_candidates(soup, url))
         service_headings.extend(extract_service_headings(soup))
 
-        # Playwright fallback if nothing found yet
+        # Playwright fallback if static scrape found nothing
         if not custom_candidates and not service_headings and playwright_available:
+            print("  Trying Playwright fallback for homepage...")
             js_soup = render_page_html(url, HEADERS)
             if js_soup:
                 custom_candidates.extend(parse_json_ld_products(js_soup, url))
@@ -481,7 +536,10 @@ def harvester(url: str, business_id: str) -> dict:
         link_href = a["href"].strip().lower()
         full_link = urljoin(url, a["href"])
 
-        if urlparse(full_link).netloc != urlparse(url).netloc:
+        try:
+            if urlparse(full_link).netloc != urlparse(url).netloc:
+                continue
+        except Exception:
             continue
         if full_link.rstrip("/") == url.rstrip("/"):
             continue
@@ -491,14 +549,13 @@ def harvester(url: str, business_id: str) -> dict:
                 if any(k in link_text or k in link_href for k in keywords):
                     found_links[category] = full_link
 
-    print(f"  Found sub-pages: {list(found_links.keys())}")
+    print(f"  Sub-pages found: {list(found_links.keys())}")
 
     for category, link in found_links.items():
         sub_soup = fetch_page(link, HEADERS)
         if not sub_soup:
             continue
 
-        # Extra extraction from key commercial pages
         if category in ("shop", "services", "pricing") and not products:
             custom_candidates.extend(parse_json_ld_products(sub_soup, link))
             custom_candidates.extend(extract_table_pricing(sub_soup))
@@ -524,6 +581,9 @@ def harvester(url: str, business_id: str) -> dict:
         for ptype, (_, text) in all_pages.items()
     )
 
+    print(f"  Total pages scraped: {len(all_pages)}")
+    print(f"  Products found: {len(products) or len(unique_candidates)}")
+
     return {
         "products":          products[:20],
         "custom_candidates": unique_candidates[:25],
@@ -535,138 +595,157 @@ def harvester(url: str, business_id: str) -> dict:
     }
 
 # ==========================================
-# 6. THE CHEF  (Claude Haiku)
+# 6. THE CHEF  (GPT-4.1-mini)
 # ==========================================
 CHEF_FALLBACK_PROMPT = """
 You are a data architect extracting structured business context for a sales AI system.
+You must return a valid JSON object only — no markdown fences, no preamble, no explanation.
 
-Determine business_type: "ecommerce" or "service".
+First, determine business_type: "ecommerce" or "service".
 
-If ecommerce — include: business_name, business_type, brand_voice, unique_selling_point,
-shipping_policy, return_policy, payment_methods,
-top_10_products (array of objects: title, price, image_url).
+If "ecommerce" include these fields:
+- business_name, business_type, brand_voice, unique_selling_point
+- shipping_policy, return_policy, payment_methods
+- top_10_products: array of { title, price, image_url }
 
-If service — include: business_name, business_type, brand_voice, unique_selling_point,
-service_packages (array: service_name, description, price),
-booking_process, service_areas.
+If "service" include these fields:
+- business_name, business_type, brand_voice, unique_selling_point
+- service_packages: array of { service_name, description, price }
+- booking_process, service_areas
 
-Both types must include:
+Both types must always include:
 - contact_info: { phone, email, physical_location }
-- faq_and_objections: [{ question, answer }]
-- social_proof: list of quotes or stats
-- payment_methods: always check for M-Pesa
+- faq_and_objections: array of { question, answer }
+- social_proof: array of quotes or stats found on the site
+- payment_methods: always look for M-Pesa — it is the dominant method in Kenya
 
-Rules:
-- Return ONLY valid JSON. No markdown fences. No preamble.
-- If a price looks like 699900, format it as 6,999.00.
-- Ignore UI elements (Cart, Login, Menu, Home).
-- Prioritise actual content over navigation text.
+Strict rules:
+- Return ONLY the JSON object. Nothing else before or after it.
+- If a price looks like 699900, it is likely stored as cents — format it as 6,999.00.
+- Ignore all UI chrome: Cart, Login, Menu, Home, Search, Subscribe.
+- Prefer content from services, pricing, and about pages over homepage text.
+- If a field has no data, use null — do not invent data.
 """
 
 
 def chef(harvested_data: dict) -> dict | None:
-    print("  [Chef] Structuring raw data...")
+    print("  [Chef] Structuring raw data with GPT-4.1-mini...")
+
     config        = fetch_bot_config("scraper_data_cleaner")
-    system_prompt = config.get("prompt", CHEF_FALLBACK_PROMPT)
-    model         = config.get("model", CLAUDE_MODEL)
+    model         = config.get("model", OPENAI_MODEL)
     max_tokens    = config.get("max_tokens", 4096)
+    temperature   = config.get("temperature", 0.2)
+    system_prompt = config.get("prompt", CHEF_FALLBACK_PROMPT)
 
     user_content = (
-        f"WEBSITE TEXT:\n{harvested_data['text'][:40000]}\n\n"
-        f"CONTACT INFO:\n{json.dumps(harvested_data.get('contact_info', {}))}\n\n"
+        f"WEBSITE TEXT:\n{harvested_data['text'][:50000]}\n\n"
+        f"CONTACT INFO DETECTED:\n{json.dumps(harvested_data.get('contact_info', {}))}\n\n"
         f"SERVICE HEADINGS:\n{json.dumps(harvested_data.get('service_headings', []))}\n\n"
     )
     if harvested_data.get("products"):
-        user_content += f"STRUCTURED PRODUCTS:\n{json.dumps(harvested_data['products'])}"
+        user_content += f"STRUCTURED PRODUCTS (from API):\n{json.dumps(harvested_data['products'])}"
     else:
-        user_content += f"EXTRACTED CANDIDATES:\n{json.dumps(harvested_data.get('custom_candidates', []))}"
+        user_content += f"EXTRACTED CANDIDATES (from HTML):\n{json.dumps(harvested_data.get('custom_candidates', []))}"
 
     try:
-        response = client_ai.messages.create(
+        response = client_ai.chat.completions.create(
             model=model,
+            temperature=temperature,
             max_tokens=max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}]
+            response_format={"type": "json_object"},   # forces clean JSON, no fences
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_content}
+            ]
         )
-        raw = response.content[0].text.strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw)
-        raw = re.sub(r'\s*```$', '', raw)
-        profile = json.loads(raw)
+        profile = json.loads(response.choices[0].message.content)
 
+        # If Shopify/WooCommerce returned structured products, use those directly
         if profile.get("business_type") == "ecommerce" and harvested_data.get("products"):
             profile["top_10_products"] = harvested_data["products"]
 
         print("  [Chef] ✓ Profile structured")
         return profile
+
     except Exception as e:
         print(f"  [Chef] ✗ {e}")
         return None
 
 # ==========================================
-# 7. THE ARCHITECT  (Claude Haiku)
+# 7. THE ARCHITECT  (GPT-4.1-mini)
 # ==========================================
 ARCHITECT_FALLBACK_PROMPT = """
-You are a business knowledge architect. Transform the JSON profile and raw website text
-into a 'Business Essence' document — the complete operational knowledge base for an AI
-sales agent. Write it as instructions for a perfect employee, not for a developer.
+You are a business knowledge architect. Your job is to transform a structured business
+JSON profile and raw website text into a 'Business Essence' document.
 
-STRUCTURE:
+This document will be the complete knowledge base for an AI agent that handles
+customer conversations and sales for this business. Write it as a manual for
+a perfect employee — not for a developer. Never mention AI, prompts, or chatbots.
+
+DOCUMENT STRUCTURE:
 
 1. BUSINESS IDENTITY & ESSENCE
-   - Core Role (professional persona in one sentence)
-   - Brand Voice (specific linguistic traits, tone, Kenyan market nuances)
-   - Competitive Edge (specific USPs from the data — no generic claims)
+   - Core Role: one sentence describing the professional persona
+   - Brand Voice: specific tone, language style, Kenyan market nuances
+   - Competitive Edge: the specific USPs extracted from the data — no generic claims
 
 2. LOGIC-DRIVEN SALES WORKFLOW
-   Use If/Then logic and 'Agent Must' directives.
-   - PHASE 1: Hook & Qualify — how to open and identify real leads
-   - PHASE 2: Discovery — exact data points to extract before recommending
-   - PHASE 3: The Pitch — how to present based on discovery findings
-   - PHASE 4: Objection Handling — specific rebuttals using this business's facts
-   - PHASE 5: The Close — criteria for a close + exact call to action
+   Use If/Then logic and 'Agent Must' directives throughout.
+   - PHASE 1: Hook & Qualify — how to open conversations, how to identify real leads
+   - PHASE 2: Discovery — the exact data points to collect before making a recommendation
+   - PHASE 3: The Pitch — how to present the solution based on what was discovered
+   - PHASE 4: Objection Handling — specific rebuttals using this business's actual facts
+     (price, trust, timeline, delivery — cover all common ones with business-specific answers)
+   - PHASE 5: The Close — the criteria for a close and the exact call-to-action to use
 
 3. BUSINESS GUARDRAILS
-   - Things the agent must never say or promise
-   - Situations requiring human handover
+   - Things the agent must never say, promise, or claim
+   - Specific situations that require human handover
 
 4. PRODUCT / SERVICE CATALOGUE
-   - Organised categories with descriptions and pricing
-   - Payment options (M-Pesa, bank, cash, etc.)
-   - Delivery, booking windows, or fulfillment details
+   - Organised by category with descriptions and pricing
+   - Payment methods with M-Pesa instructions if available
+   - Delivery timelines, booking windows, service area limits
 
 5. CONTACTS & TRUST SIGNALS
-   - All phones, emails, physical locations found
-   - Testimonials, certifications, notable clients
+   - All phone numbers, emails, physical addresses found
+   - Testimonials, repeat customer references, certifications, notable clients
 
-Rules:
-- Reference specific local details (areas, M-Pesa, Kenyan context)
-- Never mention AI, prompts, or chatbots
-- Be specific — a generic output is a failed output
+Strict rules:
+- Reference specific Kenyan context: city names, M-Pesa, local phrases, local norms
+- Be specific throughout — a generic output is a failed output
+- Never write 'the AI' or 'the chatbot' — write 'the agent' or just use directives
 """
 
 
 def architect(profile: dict, raw_text: str) -> str | None:
-    print("  [Architect] Building knowledge document...")
+    print("  [Architect] Building knowledge document with GPT-4.1-mini...")
+
     config        = fetch_bot_config("scraper_knowledge_builder")
-    system_prompt = config.get("prompt", ARCHITECT_FALLBACK_PROMPT)
-    model         = config.get("model", CLAUDE_MODEL)
+    model         = config.get("model", OPENAI_MODEL)
     max_tokens    = config.get("max_tokens", 4096)
+    temperature   = config.get("temperature", 0.3)
+    system_prompt = config.get("prompt", ARCHITECT_FALLBACK_PROMPT)
 
     user_content = (
         f"JSON PROFILE:\n{json.dumps(profile, ensure_ascii=False)}\n\n"
-        f"RAW SCRAPED TEXT:\n{raw_text[:30000]}"
+        f"RAW SCRAPED TEXT (first 40,000 chars):\n{raw_text[:40000]}"
     )
 
     try:
-        response = client_ai.messages.create(
+        response = client_ai.chat.completions.create(
             model=model,
+            temperature=temperature,
             max_tokens=max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}]
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_content}
+            ]
         )
-        result = response.content[0].text
+        result = response.choices[0].message.content
         print("  [Architect] ✓ Knowledge document built")
         return result
+
     except Exception as e:
         print(f"  [Architect] ✗ {e}")
         return None
@@ -688,43 +767,43 @@ def generate_business_profile(req: OnboardingRequest):
     url         = req.url.strip()
 
     try:
-        # ── 0. Mark as running ──────────────────────────────────
+        # 0. Mark running
         update_scrape_status(business_id, "running")
         print(f"\n[START] business_id={business_id}  url={url}")
 
-        # ── 1. Harvest ──────────────────────────────────────────
+        # 1. Harvest raw data
         raw_info = harvester(url, business_id)
 
-        # ── 2. Persist each page to raw_website_data ────────────
+        # 2. Save each page to raw_website_data
         for page_type, (page_url, page_text) in raw_info.get("all_pages", {}).items():
             save_raw_page(business_id, page_url, page_type, page_text)
 
-        # ── 3. Chef ─────────────────────────────────────────────
+        # 3. Chef — structure into JSON profile
         final_profile = chef(raw_info)
         if not final_profile:
             update_scrape_status(business_id, "failed")
             raise HTTPException(status_code=500, detail="Chef failed to structure data.")
 
-        # ── 4. Architect ─────────────────────────────────────────
+        # 4. Architect — build knowledge document
         knowledge_md = architect(final_profile, raw_info["text"])
         if not knowledge_md:
             update_scrape_status(business_id, "failed")
             raise HTTPException(status_code=500, detail="Architect failed to build knowledge.")
 
-        # ── 5. Persist to businesses table ───────────────────────
+        # 5. Save to businesses table
         save_business_knowledge(business_id, knowledge_md, final_profile)
         update_scrape_status(business_id, "done")
 
         print(f"[DONE] business_id={business_id}\n")
 
         return {
-            "business_id":   business_id,
-            "name":          final_profile.get("business_name", "Unknown"),
-            "profile_json":  final_profile,
+            "business_id":     business_id,
+            "name":            final_profile.get("business_name", "Unknown"),
+            "profile_json":    final_profile,
             "instructions_md": knowledge_md,
-            "products":      raw_info.get("products") or raw_info.get("custom_candidates", []),
-            "pages_scraped": list(raw_info.get("all_pages", {}).keys()),
-            "contact_info":  raw_info.get("contact_info", {})
+            "products":        raw_info.get("products") or raw_info.get("custom_candidates", []),
+            "pages_scraped":   list(raw_info.get("all_pages", {}).keys()),
+            "contact_info":    raw_info.get("contact_info", {})
         }
 
     except HTTPException:
@@ -753,6 +832,7 @@ def get_scrape_status(business_id: str):
 @app.get("/")
 def read_root():
     return {"message": "Scraper service active"}
+
 
 @app.get("/health")
 def health_check():
